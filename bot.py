@@ -69,6 +69,8 @@ from execution.risk_engine import get_risk_engine
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
+# === THREE LAYER BRAIN (作者三层置信系统) ===
+from core.strategy_brain.three_layer_brain import ThreeLayerBrain
 load_dotenv()
 from patch_market_orders import apply_market_order_patch
 patch_applied = apply_market_order_patch()
@@ -211,12 +213,13 @@ class IntegratedBTCStrategy(Strategy):
 
         # Phase 5: Risk Management
         self.risk_engine = get_risk_engine()
-
         # Phase 6: Performance Tracking
         self.performance_tracker = get_performance_tracker()
-
         # Phase 7: Learning Engine
         self.learning_engine = get_learning_engine()
+
+        # === THREE LAYER BRAIN 初始化（核心）===
+        self.brain = ThreeLayerBrain()
 
         # Phase 6: Grafana (optional)
         if enable_grafana:
@@ -886,72 +889,58 @@ class IntegratedBTCStrategy(Strategy):
                 f"score={sig.score:.1f}, confidence={sig.confidence:.2%}"
             )
 
-        # --- Phase 4c: Fuse signals into one consensus ---
-        # min_score lowered to 40 because the TREND FILTER (price at min 11-13)
-        # is now the primary decision maker. Fusion is informational context,
-        # not the trade gate. The trend gate below is the real filter.
-        fused = self.fusion_engine.fuse_signals(signals, min_signals=1, min_score=40.0)
-        if not fused:
-            logger.info("Fusion produced no actionable signal — no trade this interval")
-            return
-
-        logger.info(
-            f"FUSED SIGNAL: {fused.direction.value} "
-            f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
-        )
-
-        # --- Phase 5: Position size is always exactly $1.00 ---
-        POSITION_SIZE_USD = Decimal("1.00")
-
-        # =========================================================================
-        # TREND FILTER — replaces signal-based direction at the late trade window
-        #
-        # At minute 13, the Polymarket price IS the market's verdict on BTC direction.
-        # We ignore what the signal processors say and simply follow the price:
-        #
-        #   price > 0.60 → market says UP with >60% confidence → buy YES
-        #   price < 0.40 → market says DOWN with >60% confidence → buy NO
-        #   price 0.40–0.60 → too close to call → SKIP (this is where we were losing)
-        #
-        # This directly addresses the observation that trades at 1.9–2.0+ shares
-        # (price near $0.50) almost always lose, while trades at 1.4 shares
-        # (price ~$0.71) mostly win.
-        # =========================================================================
-        TREND_UP_THRESHOLD   = 0.60   # price above this → buy YES (UP)
-        TREND_DOWN_THRESHOLD = 0.40   # price below this → buy NO (DOWN)
-
-        price_float = float(current_price)
-
-        if price_float > TREND_UP_THRESHOLD:
-            direction = "long"
-            trend_confidence = price_float  # e.g. 0.72 = 72% confident UP
-            logger.info(
-                f" TREND: UP ({price_float:.2%} YES probability) → buying YES"
-            )
-        elif price_float < TREND_DOWN_THRESHOLD:
-            direction = "short"
-            trend_confidence = 1.0 - price_float  # e.g. 0.31 price = 69% confident DOWN
-            logger.info(
-                f" TREND: DOWN ({price_float:.2%} YES probability = {1-price_float:.2%} NO) → buying NO"
-            )
+        # === THREE LAYER BRAIN DECISION (作者思路完整复制) ===
+        # 计算 Defense Sentinel 需要参数
+        if hasattr(self, '_last_bid_ask') and self._last_bid_ask:
+            last_bid, last_ask = self._last_bid_ask
+            mid = (last_bid + last_ask) / 2
+            spread = float((last_ask - last_bid) / mid) if mid > 0 else 0.005
         else:
-            logger.info(
-                f"⏭ TREND: NEUTRAL ({price_float:.2%}) — price too close to 0.50, SKIPPING trade "
-                f"(coin flip territory: {TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%})"
-            )
-            return
+            spread = 0.005
 
-        # Risk engine: only check position-count / exposure limits (no sizing math)
-        is_valid, error = self.risk_engine.validate_new_position(
-            size=POSITION_SIZE_USD,
-            direction=direction,
-            current_price=current_price,
+        time_left_sec = 90                     # 交易窗口内剩余时间（可后续优化）
+        cvd_agree = True                       # TODO: 后面接真实CVD
+        is_volatile = metadata.get("volatility", 0) > 0.015
+        margin_ok = True
+
+        current_features = {
+            "oracle_delta": metadata.get("deviation", 0.0),
+            "momentum": metadata.get("momentum", 0.0),
+            "volatility": metadata.get("volatility", 0.0),
+            "price_level": float(current_price),
+        }
+
+        voted, size, should_trade = self.brain.decide(
+            signals=signals,
+            features=current_features,
+            price=current_price,
+            time_left_sec=time_left_sec,
+            spread=spread,
+            cvd_agree=cvd_agree,
+            volatile=is_volatile,
+            margin_ok=margin_ok
         )
-        if not is_valid:
-            logger.warning(f"Risk engine blocked trade: {error}")
+
+        if not should_trade or size <= 0:
+            logger.info("🛡️ ThreeLayerBrain Defense Sentinel 拒绝本次交易")
             return
 
-        logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
+        logger.info(f"✅ ThreeLayerBrain 通过 → {voted.direction} | Size: ${float(size):.2f} | Confidence: {voted.confidence:.1%}")
+
+        # === 保留你的 TREND FILTER 作为最终方向（强趋势才交易）===
+        price_float = float(current_price)
+        if price_float > 0.60:
+            direction = "long"
+            logger.info(f" TREND: UP ({price_float:.2%} YES) → buying YES")
+        elif price_float < 0.40:
+            direction = "short"
+            logger.info(f" TREND: DOWN → buying NO")
+        else:
+            logger.info(f"⏭ TREND: NEUTRAL — skipping")
+            return
+
+        # 用 brain 返回的动态 size（代替固定$1）
+        POSITION_SIZE_USD = size
 
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
